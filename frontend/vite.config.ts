@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import path from 'node:path';
@@ -7,5 +8,9 @@ export default defineConfig({
   resolve: {
     alias: { $lib: path.resolve('./src/lib') }
   },
-  worker: { format: 'es' }
+  worker: { format: 'es' },
+  test: {
+    include: ['src/lib/**/*.test.ts'],
+    environment: 'node'
+  }
 });
