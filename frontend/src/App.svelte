@@ -1,6 +1,7 @@
 <script lang="ts">
   import { collectGateEnv, gate, NOT_SUPPORTED_COPY } from '$lib/browser/gate';
-  import { applyMaskAlphaInto } from '$lib/image/overlay';
+  import { applyMaskAlphaInto, drawSlabOverlay } from '$lib/image/overlay';
+  import { boxForAxis, hullFromMask, minAreaRectFromHull, type SlabRect } from '$lib/image/minAreaRect';
   import type { MaskRequest, MaskResponse, SheetMode } from '$lib/image/mask';
 
   type AppState = 'resume' | 'photo' | 'mask' | 'axis' | 'measure';
@@ -15,6 +16,7 @@
   let draftExists = $state(false);
   let fileInput: HTMLInputElement | null = $state(null);
   let previewCanvas: HTMLCanvasElement | null = $state(null);
+  let overlayCanvas: HTMLCanvasElement | null = $state(null);
   let wrapW = $state(360);
   let viewH = $state(800);
 
@@ -35,6 +37,9 @@
   let workCanvas: HTMLCanvasElement | null = null;
   let mask: Uint8Array | null = null;
   let lastGoodMask = $state(false);
+  let hull: Float64Array | null = null;
+  let rect = $state<SlabRect | null>(null);
+  let axisAngleDeg = $state(0);
   let maskReady = false;
   let worker: Worker | null = null;
   let requestSeq = 0;
@@ -54,6 +59,11 @@
     }
     return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
   });
+
+  /** Slab extent along the approved length axis, in source pixels. */
+  const axisBox = $derived.by(() =>
+    hull ? boxForAxis(hull, (axisAngleDeg * Math.PI) / 180) : null
+  );
 
   function makeCanvas(width: number, height: number): HTMLCanvasElement {
     const canvas = document.createElement('canvas');
@@ -188,8 +198,29 @@
   }
 
   function approveMask() {
-    if (!lastGoodMask || slabPixelCount === 0) return;
+    if (!lastGoodMask || slabPixelCount === 0 || !mask) return;
+    hull = hullFromMask(mask, srcW, srcH);
+    rect = hull ? minAreaRectFromHull(hull) : null;
+    axisAngleDeg = rect ? (rect.angleRad * 180) / Math.PI : 0;
     state = 'axis';
+  }
+
+  function approveAxis() {
+    if (!rect || !axisBox) return;
+    state = 'measure';
+  }
+
+  /** Rectangle and axis are drawn in display pixels from source-pixel geometry. */
+  function drawAxis() {
+    if (!overlayCanvas || !rect || !axisBox) return;
+    const { w, h } = previewBox;
+    if (w < 1 || h < 1) return;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    overlayCanvas.width = Math.max(1, Math.round(w * dpr));
+    overlayCanvas.height = Math.max(1, Math.round(h * dpr));
+    const ctx = overlayCanvas.getContext('2d');
+    if (!ctx) return;
+    drawSlabOverlay(ctx, rect, axisBox, { k: (w * dpr) / srcW, dpr });
   }
 
   function retake() {
@@ -198,6 +229,9 @@
     workCanvas = null;
     mask = null;
     lastGoodMask = false;
+    hull = null;
+    rect = null;
+    axisAngleDeg = 0;
     slabPixelCount = 0;
     sheetUsed = null;
     maskReady = false;
@@ -240,7 +274,9 @@
     void previewBox.w;
     void previewBox.h;
     void state;
+    void axisAngleDeg;
     drawPreview();
+    if (state === 'axis') drawAxis();
   });
 </script>
 
@@ -251,6 +287,13 @@
         bind:this={previewCanvas}
         style="width:{previewBox.w}px;height:{previewBox.h}px"
       ></canvas>
+      {#if state === 'axis'}
+        <canvas
+          class="overlay"
+          bind:this={overlayCanvas}
+          style="width:{previewBox.w}px;height:{previewBox.h}px"
+        ></canvas>
+      {/if}
       {#if busy}
         <span class="busy" aria-label="working"></span>
       {/if}
@@ -349,10 +392,49 @@
       <button class="text" onclick={back}>Back</button>
     {/if}
 
-    {#if state === 'axis' || state === 'measure'}
+    {#if state === 'axis'}
+      {@render preview()}
+
+      <div class="field">
+        <div class="row">
+          <span class="label">Rotate axis</span>
+          <span class="grow"></span>
+          <span class="value">{axisAngleDeg.toFixed(1)}°</span>
+        </div>
+        <div class="row">
+          <button
+            class="thumb"
+            aria-label="rotate axis counter clockwise"
+            onclick={() => (axisAngleDeg = Math.max(-90, axisAngleDeg - 0.5))}>−</button
+          >
+          <span class="grow">
+            <input
+              type="range"
+              min="-90"
+              max="90"
+              step="0.5"
+              value={axisAngleDeg}
+              oninput={(event) => (axisAngleDeg = Number(event.currentTarget.value))}
+            />
+          </span>
+          <button
+            class="thumb"
+            aria-label="rotate axis clockwise"
+            onclick={() => (axisAngleDeg = Math.min(90, axisAngleDeg + 0.5))}>+</button
+          >
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="primary" disabled={!rect || !axisBox} onclick={approveAxis}>Approve axis</button>
+      </div>
+      <button class="text" onclick={back}>Back</button>
+    {/if}
+
+    {#if state === 'measure'}
       {@render preview()}
       <div class="field">
-        <p class="label">{state === 'axis' ? 'Length axis' : 'Measure'}</p>
+        <p class="label">Measure</p>
         <p class="hint">Not built yet.</p>
       </div>
       <button class="text" onclick={back}>Back</button>
