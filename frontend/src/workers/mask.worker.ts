@@ -1,35 +1,32 @@
-import { runMask, type SheetMode } from '../lib/image/mask';
+/// <reference lib="webworker" />
+/**
+ * Mask worker. The key runs here and nowhere else, on source pixels.
+ */
 
-self.onmessage = (ev: MessageEvent) => {
-  const { id, width, height, buffer, sheet, sensitivity } = ev.data as {
-    id: number;
-    width: number;
-    height: number;
-    buffer: ArrayBuffer;
-    sheet: SheetMode;
-    sensitivity: number;
-  };
+import { runMask, type MaskRequest, type MaskResponse } from '../lib/image/mask';
+
+const ctx = self as unknown as DedicatedWorkerGlobalScope;
+
+ctx.onmessage = (event: MessageEvent<MaskRequest>) => {
+  const { id, data, width, height, sheet, sensitivity } = event.data;
   try {
-    const data = new Uint8ClampedArray(buffer);
-    const result = runMask({ data, width, height }, sheet, sensitivity);
-    const maskCopy = result.mask.buffer.slice(0);
-    (self as DedicatedWorkerGlobalScope).postMessage(
-      {
-        id,
-        ok: true,
-        width: result.width,
-        height: result.height,
-        pixelCount: result.pixelCount,
-        sheetUsed: result.sheetUsed,
-        mask: maskCopy
-      },
-      [maskCopy]
-    );
-  } catch (err) {
-    (self as DedicatedWorkerGlobalScope).postMessage({
+    const outcome = runMask({ data, width, height }, sheet, sensitivity);
+    const response: MaskResponse = {
+      id,
+      ok: true,
+      mask: outcome.mask,
+      width: outcome.width,
+      height: outcome.height,
+      slabPixelCount: outcome.slabPixelCount,
+      sheetUsed: outcome.sheetUsed
+    };
+    ctx.postMessage(response, [outcome.mask.buffer as ArrayBuffer]);
+  } catch (error) {
+    const response: MaskResponse = {
       id,
       ok: false,
-      error: err instanceof Error ? err.message : String(err)
-    });
+      error: error instanceof Error ? error.message : String(error)
+    };
+    ctx.postMessage(response);
   }
 };
