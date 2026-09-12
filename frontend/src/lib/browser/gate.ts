@@ -1,18 +1,22 @@
 /**
  * Browser gate.
  *
- * Phone: iOS Safari, Android Chrome.
- * PC: Chrome, Edge, Firefox.
+ * Allowed: iOS Safari, Android Chrome, desktop Chrome, Edge, Firefox.
  * Every other client gets a hard stop screen. There is no app.
  *
- * The gate is engine based, so a desktop Chromium browser that is not branded
- * Chrome or Edge passes. See docs/CAPTURE.md "Browsers".
+ * The gate is brand strict, not engine strict: Brave, Vivaldi, Opera, Samsung
+ * Internet, Chromium, Android Firefox, iOS Chrome and desktop Safari are all
+ * refused even though several of them share an engine with an allowed browser.
+ *
+ * Brave hides from the user agent on Android and desktop, so its injected
+ * `navigator.brave` object is part of the check.
  */
 
 export type ClientFamily =
   | 'ios-safari'
   | 'android-chrome'
-  | 'desktop-chromium'
+  | 'desktop-chrome'
+  | 'desktop-edge'
   | 'desktop-firefox'
   | 'unsupported';
 
@@ -20,6 +24,7 @@ export type GateEnv = {
   userAgent: string;
   platform: string;
   maxTouchPoints: number;
+  isBrave: boolean;
   hasCreateImageBitmap: boolean;
   hasWorker: boolean;
   hasIndexedDb: boolean;
@@ -35,13 +40,24 @@ export type GateResult = {
 
 export const NOT_SUPPORTED_COPY = 'This browser is not supported';
 
+/** iOS browsers that are not Safari, plus in-app web views. */
+const IOS_NOT_SAFARI =
+  /CriOS|FxiOS|EdgiOS|OPiOS|GSA|DuckDuckGo|Mercury|YaBrowser|Yandex|Oculus|FBAN|FBAV|Instagram|Line\/|MicroMessenger|Twitter|Pinterest|SnapChat/i;
+
+/** Tokens that disqualify a Chrome user agent string. */
+const NOT_CHROME =
+  /EdgA\/|Edg\/|Edge\/|OPR\/|Opera|SamsungBrowser|YaBrowser|DuckDuckGo|Firefox\/|Vivaldi\/|Chromium\/|Brave|UCBrowser|QQBrowser|MiuiBrowser|HuaweiBrowser|Oculus|Puffin/i;
+
 export function collectGateEnv(nav: Navigator = navigator, win: Window & typeof globalThis = window): GateEnv {
   const canvas = typeof win.document !== 'undefined' ? win.document.createElement('canvas') : null;
   const ctx = canvas ? canvas.getContext('2d') : null;
+  const brave = (nav as Navigator & { brave?: { isBrave?: () => Promise<boolean> } }).brave;
   return {
     userAgent: nav.userAgent,
     platform: nav.platform ?? '',
     maxTouchPoints: nav.maxTouchPoints ?? 0,
+    // Brave injects this object on desktop and Android. No user agent tells.
+    isBrave: typeof brave !== 'undefined' && brave !== null,
     hasCreateImageBitmap: typeof win.createImageBitmap === 'function',
     hasWorker: typeof win.Worker === 'function',
     hasIndexedDb: typeof win.indexedDB !== 'undefined' && win.indexedDB !== null,
@@ -54,29 +70,29 @@ export function collectGateEnv(nav: Navigator = navigator, win: Window & typeof 
 
 export function isIos(env: GateEnv): boolean {
   if (/iPhone|iPad|iPod/i.test(env.userAgent)) return true;
+  // iPadOS reports itself as a Mac with touch.
   return /Macintosh|Mac OS X/i.test(env.userAgent) && env.maxTouchPoints > 1;
 }
 
 export function identifyFamily(env: GateEnv): ClientFamily {
   const ua = env.userAgent;
 
+  if (env.isBrave || /Brave/i.test(ua)) return 'unsupported';
+
   if (isIos(env)) {
-    // On iOS every browser is WebKit; the spec names Safari, so in-app and
-    // third party iOS browsers (Chrome, Firefox, Edge, Opera, Google app) stop.
-    const thirdParty = /CriOS|FxiOS|EdgiOS|OPiOS|GSA|DuckDuckGo|Mercury/i.test(ua);
-    const isSafari = /Safari\//.test(ua) && !thirdParty;
+    const isSafari = /Safari\//.test(ua) && !IOS_NOT_SAFARI.test(ua);
     return isSafari ? 'ios-safari' : 'unsupported';
   }
 
   if (/Android/i.test(ua)) {
-    const androidChrome =
-      /Chrome\//.test(ua) && !/EdgA\/|Firefox\/|SamsungBrowser|OPR\/|YaBrowser/i.test(ua);
+    const androidChrome = /Chrome\//.test(ua) && !NOT_CHROME.test(ua);
     return androidChrome ? 'android-chrome' : 'unsupported';
   }
 
-  if (/Firefox\//.test(ua) && !/Seamonkey/i.test(ua)) return 'desktop-firefox';
-  if (/Chrome\/|Chromium\//.test(ua) && !/OPR\/|Edge\//.test(ua)) return 'desktop-chromium';
-  if (/Edg\//.test(ua)) return 'desktop-chromium';
+  if (/Vivaldi\/|OPR\/|Opera|Chromium\/|Edge\//i.test(ua)) return 'unsupported';
+  if (/Firefox\//i.test(ua) && !/Seamonkey/i.test(ua)) return 'desktop-firefox';
+  if (/Edg\//i.test(ua)) return 'desktop-edge';
+  if (/Chrome\//.test(ua)) return 'desktop-chrome';
 
   return 'unsupported';
 }

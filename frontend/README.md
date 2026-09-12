@@ -33,8 +33,9 @@ state; approve advances. One photo component is reused by every state after Add 
 ## Browser support
 
 Phone: iOS Safari, Android Chrome. PC: Chrome, Edge, Firefox. Anything else gets a hard
-stop screen. The gate is engine based (`src/lib/browser/gate.ts`), so desktop Chromium
-browsers other than Chrome/Edge also pass.
+stop screen. The gate is brand strict (`src/lib/browser/gate.ts`), not engine strict — Brave,
+Vivaldi, Opera, Chromium, Samsung Internet, Android Firefox, iOS Chrome, and desktop Safari
+are refused even where they share an engine with an allowed browser.
 
 ## Rules that matter
 
