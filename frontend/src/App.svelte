@@ -1,6 +1,13 @@
 <script lang="ts">
   import { collectGateEnv, gate, NOT_SUPPORTED_COPY } from '$lib/browser/gate';
-  import { applyMaskAlphaInto, drawSlabOverlay } from '$lib/image/overlay';
+  import { applyMaskAlphaInto, drawSlabOverlay, maskPixelCount } from '$lib/image/overlay';
+  import {
+    clearDraft,
+    loadDraft,
+    saveDraft,
+    type Draft,
+    type DraftState
+  } from '$lib/draft/store';
   import { boxForAxis, hullFromMask, minAreaRectFromHull, type SlabRect } from '$lib/image/minAreaRect';
   import { sampleWidths, type WidthStats } from '$lib/image/sampleWidths';
   import {
@@ -22,6 +29,7 @@
 
   let state = $state<AppState>('photo');
   let draftExists = $state(false);
+  let photoBlob = $state<Blob | null>(null);
   let fileInput: HTMLInputElement | null = $state(null);
   let previewCanvas: HTMLCanvasElement | null = $state(null);
   let overlayCanvas: HTMLCanvasElement | null = $state(null);
@@ -61,6 +69,7 @@
   let rect = $state<SlabRect | null>(null);
   let axisAngleDeg = $state(0);
   let maskReady = false;
+  let loadedDraft: Draft | null = null;
   let worker: Worker | null = null;
   let requestSeq = 0;
   let pendingId = 0;
@@ -80,7 +89,7 @@
     const sw = previewSource.w;
     const sh = previewSource.h;
     if (!sw || !sh) return { w: 0, h: 0 };
-    const factor = state === 'measure' ? 0.46 : 0.44;
+    const factor = state === 'measure' ? (sqft === null ? 0.46 : 0.32) : 0.44;
     const maxH = Math.max(180, Math.round(viewH * factor));
     let w = Math.min(wrapW, sw);
     let h = (w * sh) / sw;
@@ -108,6 +117,7 @@
     const file = input.files?.[0] ?? null;
     input.value = '';
     if (!file) return;
+    photoBlob = file;
     await decodePhoto(file);
   }
 
@@ -234,11 +244,13 @@
     rect = hull ? minAreaRectFromHull(hull) : null;
     axisAngleDeg = rect ? (rect.angleRad * 180) / Math.PI : 0;
     state = 'axis';
+    void persist('axis');
   }
 
   function approveAxis() {
     if (!rect || !axisBox) return;
     state = 'measure';
+    void persist('measure');
   }
 
   function parseInches(text: string): number | null {
@@ -295,8 +307,114 @@
     }
   }
 
+  /** One in-progress slab on the device. Not a WooCommerce draft. */
+  function currentDraft(draftState: DraftState): Draft | null {
+    if (!photoBlob || !srcW || !srcH) return null;
+    // IndexedDB structured clones the record, so reaction wrappers must come off.
+    return {
+      version: 1,
+      state: draftState,
+      photoBlob,
+      sheet,
+      sensitivity,
+      mask: mask ? { width: srcW, height: srcH, mask: $state.snapshot(mask) } : null,
+      rect: $state.snapshot(rect),
+      axisAngleRad: (axisAngleDeg * Math.PI) / 180,
+      lengthIn: parseInches(lengthText),
+      thicknessIn: parseInches(thicknessText),
+      scale: scalePx,
+      widths: $state.snapshot(widths),
+      sqft,
+      bdft,
+      inventoryPngBlob: inventoryBlob
+    };
+  }
+  async function persist(draftState: DraftState) {
+    const draft = currentDraft(draftState);
+    if (!draft) return;
+    await saveDraft(draft);
+  }
+
+  /** Rectangle corners as a hull, used when a restored mask is unavailable. */
+  function hullFromRect(r: SlabRect): Float64Array {
+    const cos = Math.cos(r.angleRad);
+    const sin = Math.sin(r.angleRad);
+    const halfLength = r.width / 2;
+    const halfWidth = r.height / 2;
+    const out = new Float64Array(8);
+    const corners: Array<[number, number]> = [
+      [-halfLength, -halfWidth],
+      [halfLength, -halfWidth],
+      [halfLength, halfWidth],
+      [-halfLength, halfWidth]
+    ];
+    corners.forEach(([u, v], index) => {
+      out[index * 2] = r.cx + u * cos - v * sin;
+      out[index * 2 + 1] = r.cy + u * sin + v * cos;
+    });
+    return out;
+  }
+
+  /** Continue: restore the last approved state, including Measure. */
+  async function continueDraft() {
+    const draft = loadedDraft;
+    if (!draft) {
+      state = 'mask';
+      return;
+    }
+    sheet = draft.sheet;
+    sensitivity = draft.sensitivity;
+    state = 'mask';
+    await decodePhoto(draft.photoBlob);
+    photoBlob = draft.photoBlob;
+
+    if (draft.mask && draft.mask.width === srcW && draft.mask.height === srcH) {
+      mask = draft.mask.mask;
+      lastGoodMask = true;
+      slabPixelCount = maskPixelCount(mask);
+      paintMask();
+    }
+
+    rect = draft.rect;
+    hull = mask ? hullFromMask(mask, srcW, srcH) : null;
+    if (!hull && rect) hull = hullFromRect(rect);
+    axisAngleDeg = draft.rect ? (draft.axisAngleRad * 180) / Math.PI : 0;
+
+    lengthText = draft.lengthIn === null ? '' : String(draft.lengthIn);
+    thicknessText = draft.thicknessIn === null ? '' : String(draft.thicknessIn);
+    scalePx = draft.scale;
+    widths = draft.widths;
+    sqft = draft.sqft;
+    bdft = draft.bdft;
+
+    if (draft.inventoryPngBlob) {
+      inventoryBlob = draft.inventoryPngBlob;
+      if (inventoryUrl) URL.revokeObjectURL(inventoryUrl);
+      inventoryUrl = URL.createObjectURL(draft.inventoryPngBlob);
+      try {
+        const bitmap = await createImageBitmap(draft.inventoryPngBlob);
+        inventorySize = { w: bitmap.width, h: bitmap.height };
+        bitmap.close();
+      } catch {
+        inventorySize = null;
+      }
+    }
+
+    state = draft.state;
+  }
+
+  async function startFresh() {
+    loadedDraft = null;
+    draftExists = false;
+    await clearDraft();
+    retake();
+  }
+
   /** Slice 6 persists the device draft here. */
-  function onCalculated() {}
+  async function onCalculated() {
+    await persist('measure');
+    draftExists = true;
+  }
 
   /** Rectangle and axis are drawn in display pixels from source-pixel geometry. */
   function drawAxis() {
@@ -334,6 +452,9 @@
     sizeWarning = null;
     lengthText = '';
     thicknessText = '';
+    loadedDraft = null;
+    draftExists = false;
+    void clearDraft();
     state = 'photo';
   }
 
@@ -343,6 +464,20 @@
     else if (state === 'measure') state = 'axis';
     else if (state === 'photo' && draftExists) state = 'resume';
   }
+
+  $effect(() => {
+    let cancelled = false;
+    void (async () => {
+      const draft = await loadDraft();
+      if (cancelled || !draft) return;
+      loadedDraft = draft;
+      draftExists = true;
+      state = 'resume';
+    })();
+    return () => {
+      cancelled = true;
+    };
+  });
 
   $effect(() => {
     viewH = window.innerHeight;
@@ -420,8 +555,8 @@
       <div class="field">
         <p class="label">You have a slab in progress on this device.</p>
         <div class="actions">
-          <button class="primary" onclick={() => (state = 'mask')}>Continue</button>
-          <button onclick={retake}>Start fresh</button>
+          <button class="primary" onclick={continueDraft}>Continue</button>
+          <button onclick={startFresh}>Start fresh</button>
         </div>
       </div>
     {/if}
@@ -619,8 +754,6 @@
             <span class="k">Width avg</span><span class="v">{widths.avg.toFixed(2)} in</span>
             <span class="k">Sq ft</span><span class="v">{sqft.toFixed(2)}</span>
             <span class="k">Bd ft</span><span class="v">{(bdft ?? 0).toFixed(2)}</span>
-            <span class="k">Samples</span><span class="v">{widths.samples}</span>
-            <span class="k">Scale</span><span class="v">{(scalePx ?? 0).toFixed(2)} px/in</span>
           </div>
         </div>
       {/if}
