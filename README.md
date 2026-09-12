@@ -16,5 +16,5 @@ Repo: `Ty_Tech/SlabUploader` (Gitea is source of truth)
 Run capture:
 
 ```bash
-cd frontend && npm install && node scripts/check-math.mjs && npm run dev
+cd frontend && npm install && npm test && npm run dev
 ```
