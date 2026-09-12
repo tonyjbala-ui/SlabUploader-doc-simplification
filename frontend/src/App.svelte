@@ -2,6 +2,14 @@
   import { collectGateEnv, gate, NOT_SUPPORTED_COPY } from '$lib/browser/gate';
   import { applyMaskAlphaInto, drawSlabOverlay } from '$lib/image/overlay';
   import { boxForAxis, hullFromMask, minAreaRectFromHull, type SlabRect } from '$lib/image/minAreaRect';
+  import { sampleWidths, type WidthStats } from '$lib/image/sampleWidths';
+  import {
+    TOO_SMALL_COPY,
+    encodeInventoryPng,
+    type EncodeOutcome
+  } from '$lib/image/encodePng';
+  import { bdftFromSqft, sqftFromMask } from '$lib/math/area';
+  import { INCH_STEP, scalePxPerInch, snapToEighth } from '$lib/math/scale';
   import type { MaskRequest, MaskResponse, SheetMode } from '$lib/image/mask';
 
   type AppState = 'resume' | 'photo' | 'mask' | 'axis' | 'measure';
@@ -28,16 +36,28 @@
   let photoError = $state<string | null>(null);
   let maskError = $state<string | null>(null);
 
+  let lengthText = $state('');
+  let thicknessText = $state('');
+  let scalePx = $state<number | null>(null);
+  let widths = $state<WidthStats | null>(null);
+  let sqft = $state<number | null>(null);
+  let bdft = $state<number | null>(null);
+  let inventoryUrl = $state<string | null>(null);
+  let inventorySize = $state<{ w: number; h: number } | null>(null);
+  let inventoryBlob: Blob | null = null;
+  let sizeWarning = $state<string | null>(null);
+  let calculating = $state(false);
+
   // Source pixels and the work canvas are not reactive: they are large, and the
   // preview is display only. All math reads these, never the CSS size.
-  let srcW = 0;
-  let srcH = 0;
+  let srcW = $state(0);
+  let srcH = $state(0);
   let srcPixels: Uint8ClampedArray | null = null;
   let workPixels: Uint8ClampedArray | null = null;
   let workCanvas: HTMLCanvasElement | null = null;
-  let mask: Uint8Array | null = null;
+  let mask = $state<Uint8Array | null>(null);
   let lastGoodMask = $state(false);
-  let hull: Float64Array | null = null;
+  let hull = $state<Float64Array | null>(null);
   let rect = $state<SlabRect | null>(null);
   let axisAngleDeg = $state(0);
   let maskReady = false;
@@ -47,22 +67,33 @@
   let busyTimer: ReturnType<typeof setTimeout> | undefined;
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 
+  /** Slab extent along the approved length axis, in source pixels. */
+  const axisBox = $derived.by(() =>
+    hull ? boxForAxis(hull, (axisAngleDeg * Math.PI) / 180) : null
+  );
+
+  const previewSource = $derived(
+    state === 'measure' && inventorySize ? inventorySize : { w: srcW, h: srcH }
+  );
+
   const previewBox = $derived.by(() => {
-    if (!srcW || !srcH) return { w: 0, h: 0 };
+    const sw = previewSource.w;
+    const sh = previewSource.h;
+    if (!sw || !sh) return { w: 0, h: 0 };
     const factor = state === 'measure' ? 0.46 : 0.44;
     const maxH = Math.max(180, Math.round(viewH * factor));
-    let w = Math.min(wrapW, srcW);
-    let h = (w * srcH) / srcW;
+    let w = Math.min(wrapW, sw);
+    let h = (w * sh) / sw;
     if (h > maxH) {
       h = maxH;
-      w = (maxH * srcW) / srcH;
+      w = (maxH * sw) / sh;
     }
     return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
   });
 
-  /** Slab extent along the approved length axis, in source pixels. */
-  const axisBox = $derived.by(() =>
-    hull ? boxForAxis(hull, (axisAngleDeg * Math.PI) / 180) : null
+  const showInventoryPng = $derived(state === 'measure' && !!inventoryUrl);
+  const showAxisOverlay = $derived(
+    !!rect && !!axisBox && (state === 'axis' || (state === 'measure' && !showInventoryPng))
   );
 
   function makeCanvas(width: number, height: number): HTMLCanvasElement {
@@ -210,6 +241,63 @@
     state = 'measure';
   }
 
+  function parseInches(text: string): number | null {
+    const value = Number(text);
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+
+  const canCalculate = $derived(
+    parseInches(lengthText) !== null &&
+      parseInches(thicknessText) !== null &&
+      lastGoodMask &&
+      slabPixelCount > 0 &&
+      !!axisBox
+  );
+
+  function step(text: string, direction: 1 | -1): string {
+    const value = parseInches(text) ?? 0;
+    const next = Math.max(0, snapToEighth(value + direction * INCH_STEP));
+    return String(Math.round(next * 1000) / 1000);
+  }
+
+  /**
+   * scale = longest_axis_px / L, then widths, sqft, bdft, and the inventory PNG.
+   * Calculate does not create a WooCommerce product.
+   */
+  async function calculate() {
+    const lengthIn = parseInches(lengthText);
+    const thicknessIn = parseInches(thicknessText);
+    if (!mask || !axisBox || !workCanvas || lengthIn === null || thicknessIn === null) return;
+    calculating = true;
+    try {
+      const nextScale = scalePxPerInch(axisBox.lengthPx, lengthIn);
+      scalePx = nextScale;
+      widths = sampleWidths(mask, srcW, srcH, axisBox, lengthIn, nextScale);
+      sqft = sqftFromMask(slabPixelCount, nextScale);
+      bdft = bdftFromSqft(sqft, thicknessIn);
+      const outcome: EncodeOutcome = await encodeInventoryPng(workCanvas, axisBox);
+      if (outcome.requiresRetake) {
+        sizeWarning = outcome.reason ?? TOO_SMALL_COPY;
+        inventoryBlob = null;
+        inventorySize = null;
+        if (inventoryUrl) URL.revokeObjectURL(inventoryUrl);
+        inventoryUrl = null;
+      } else {
+        sizeWarning = null;
+        inventoryBlob = outcome.blob;
+        if (inventoryUrl) URL.revokeObjectURL(inventoryUrl);
+        inventoryUrl = outcome.blob ? URL.createObjectURL(outcome.blob) : null;
+        inventorySize = { w: outcome.widthPx, h: outcome.heightPx };
+      }
+      onCalculated();
+    } finally {
+      calculating = false;
+    }
+  }
+
+  /** Slice 6 persists the device draft here. */
+  function onCalculated() {}
+
   /** Rectangle and axis are drawn in display pixels from source-pixel geometry. */
   function drawAxis() {
     if (!overlayCanvas || !rect || !axisBox) return;
@@ -235,6 +323,17 @@
     slabPixelCount = 0;
     sheetUsed = null;
     maskReady = false;
+    if (inventoryUrl) URL.revokeObjectURL(inventoryUrl);
+    inventoryUrl = null;
+    inventoryBlob = null;
+    inventorySize = null;
+    widths = null;
+    sqft = null;
+    bdft = null;
+    scalePx = null;
+    sizeWarning = null;
+    lengthText = '';
+    thicknessText = '';
     state = 'photo';
   }
 
@@ -275,24 +374,34 @@
     void previewBox.h;
     void state;
     void axisAngleDeg;
+    void showInventoryPng;
     drawPreview();
-    if (state === 'axis') drawAxis();
+    if (showAxisOverlay) drawAxis();
   });
 </script>
 
 {#snippet preview()}
   <div class="preview" bind:clientWidth={wrapW}>
     <div class="stage" style="width:{previewBox.w}px;height:{previewBox.h}px">
-      <canvas
-        bind:this={previewCanvas}
-        style="width:{previewBox.w}px;height:{previewBox.h}px"
-      ></canvas>
-      {#if state === 'axis'}
+      {#if showInventoryPng}
+        <img
+          class="png"
+          src={inventoryUrl}
+          alt="Inventory PNG"
+          style="width:{previewBox.w}px;height:{previewBox.h}px"
+        />
+      {:else}
         <canvas
-          class="overlay"
-          bind:this={overlayCanvas}
+          bind:this={previewCanvas}
           style="width:{previewBox.w}px;height:{previewBox.h}px"
         ></canvas>
+        {#if showAxisOverlay}
+          <canvas
+            class="overlay"
+            bind:this={overlayCanvas}
+            style="width:{previewBox.w}px;height:{previewBox.h}px"
+          ></canvas>
+        {/if}
       {/if}
       {#if busy}
         <span class="busy" aria-label="working"></span>
@@ -433,10 +542,89 @@
 
     {#if state === 'measure'}
       {@render preview()}
+
       <div class="field">
-        <p class="label">Measure</p>
-        <p class="hint">Not built yet.</p>
+        <p class="label">Length (in)</p>
+        <div class="row">
+          <button
+            class="thumb"
+            aria-label="shorter length"
+            onclick={() => (lengthText = step(lengthText, -1))}>−</button
+          >
+          <span class="grow">
+            <input
+              type="number"
+              inputmode="decimal"
+              min="0"
+              step="0.125"
+              placeholder="0"
+              value={lengthText}
+              oninput={(event) => (lengthText = event.currentTarget.value)}
+            />
+          </span>
+          <button
+            class="thumb"
+            aria-label="longer length"
+            onclick={() => (lengthText = step(lengthText, 1))}>+</button
+          >
+        </div>
       </div>
+
+      <div class="field">
+        <p class="label">Thickness (in)</p>
+        <div class="row">
+          <button
+            class="thumb"
+            aria-label="thinner"
+            onclick={() => (thicknessText = step(thicknessText, -1))}>−</button
+          >
+          <span class="grow">
+            <input
+              type="number"
+              inputmode="decimal"
+              min="0"
+              step="0.125"
+              placeholder="0"
+              value={thicknessText}
+              oninput={(event) => (thicknessText = event.currentTarget.value)}
+            />
+          </span>
+          <button
+            class="thumb"
+            aria-label="thicker"
+            onclick={() => (thicknessText = step(thicknessText, 1))}>+</button
+          >
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="primary" disabled={!canCalculate || calculating} onclick={calculate}>
+          Calculate
+        </button>
+      </div>
+
+      {#if sizeWarning}
+        <div class="field">
+          <p class="warn">{sizeWarning}</p>
+          <button onclick={retake}>Retake photo</button>
+        </div>
+      {/if}
+
+      {#if sqft !== null && widths}
+        <div class="field">
+          <p class="label">Inventory</p>
+          <div class="readout">
+            <span class="k">Width min</span><span class="v">{widths.min.toFixed(2)} in</span>
+            <span class="k">Width max</span><span class="v">{widths.max.toFixed(2)} in</span>
+            <span class="k">Width avg</span><span class="v">{widths.avg.toFixed(2)} in</span>
+            <span class="k">Sq ft</span><span class="v">{sqft.toFixed(2)}</span>
+            <span class="k">Bd ft</span><span class="v">{(bdft ?? 0).toFixed(2)}</span>
+            <span class="k">Samples</span><span class="v">{widths.samples}</span>
+            <span class="k">Scale</span><span class="v">{(scalePx ?? 0).toFixed(2)} px/in</span>
+          </div>
+        </div>
+      {/if}
+
       <button class="text" onclick={back}>Back</button>
     {/if}
   </div>
@@ -451,6 +639,13 @@
     position: absolute;
     left: 0;
     top: 0;
+  }
+
+  .stage img.png {
+    position: absolute;
+    left: 0;
+    top: 0;
+    display: block;
   }
 
   .busy {
