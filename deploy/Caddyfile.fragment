@@ -1,0 +1,14 @@
+# Merge into host Caddy. Replace {$APP_HOSTNAME} from inventory / .env.
+# handle /api/* MUST come before the frontend catch-all.
+
+{$APP_HOSTNAME} {
+	tls internal
+	handle /api/* {
+		reverse_proxy fastapi:8000
+	}
+	handle {
+		reverse_proxy frontend:80 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+}

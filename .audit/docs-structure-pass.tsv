@@ -1,0 +1,7 @@
+ts	phase	decision	why	evidence	result
+2026-09-09T19:43:56Z	harness	ran check-structure.sh on untouched main tip	capture red baseline before structure edits	docs/checks/check-structure.sh	FAILED as expected (red baseline)
+2026-09-09T19:45:25Z	frame	done predicate is check-structure.sh exit 0 with lock phrases intact	falsifiable gate for structure pass	.audit/docs-structure-pass.tsv	open
+2026-09-09T19:45:25Z	unit	AGENTS ownership complete; Gates table removed; UX-DESIGN demoted; IMPL-PLAN owns gate meanings	subtract calendar restatement and close ownership gap	AGENTS.md,docs/UX-DESIGN.md,docs/IMPL-PLAN.md	check-structure PASSED
+2026-09-09T19:45:25Z	unit	TEST-SPEC and deploy docs label missing tree as Phase 0 targets	stop agents inventing harness paths that are not on main	docs/TEST-SPEC.md,docs/DEPLOYMENT.md,deploy/docker-compose.yml,README.md	check-structure PASSED
+2026-09-09T19:45:25Z	verify	ran docs/checks/check-structure.sh after all edits	prove done predicate on real artifact	docs/checks/check-structure.sh exit 0	VERIFIED
+2026-09-09T19:47:17Z	attention-fix	restored Gate B meaning to original AGENTS wording; hardened check-structure for both deploy files and fuller math lock phrase	Attention review flagged Gate B parenthetical as lock drift and weak deploy grep	docs/IMPL-PLAN.md,docs/checks/check-structure.sh	check-structure PASSED
